@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
+using System.Collections.Concurrent;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace WebApiTokenBasedAuthendication.Controllers
@@ -10,16 +12,37 @@ namespace WebApiTokenBasedAuthendication.Controllers
     [Route("api/Authendication")]
     public class AuthendicationController : ControllerBase
     {
+        private static readonly ConcurrentDictionary<string, RefreshTokenInfo> RefreshTokens = new();
         private readonly IConfiguration _configuration;
 
         public AuthendicationController(IConfiguration configuration)
         {
-            this._configuration = configuration?? throw new ArgumentNullException(nameof(configuration));
+            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         }
+
         public class AuthendicateionRequestBody
         {
             public string? UserName { get; set; }
             public string? Password { get; set; }
+        }
+
+        public class RefreshTokenRequestBody
+        {
+            public string? RefreshToken { get; set; }
+        }
+
+        public class TokenResponse
+        {
+            public string AccessToken { get; set; } = string.Empty;
+            public string RefreshToken { get; set; } = string.Empty;
+            public DateTime AccessTokenExpiryUtc { get; set; }
+            public DateTime RefreshTokenExpiryUtc { get; set; }
+        }
+
+        private sealed class RefreshTokenInfo
+        {
+            public int UserId { get; init; }
+            public DateTime ExpiresAtUtc { get; init; }
         }
 
         private class RequestedUserinfo
@@ -36,12 +59,12 @@ namespace WebApiTokenBasedAuthendication.Controllers
                 UserName = userName;
                 FirstName = firstName;
                 LastName = lastName;
-                City= city;
+                City = city;
             }
         }
 
         [HttpPost("authendicate")]
-        public ActionResult<string> Authendicate(AuthendicateionRequestBody authendicateionRequestBody)
+        public ActionResult<TokenResponse> Authendicate(AuthendicateionRequestBody authendicateionRequestBody)
         {
             var user = ValidateUserCredentials(authendicateionRequestBody.UserName, authendicateionRequestBody.Password);
             if (user == null)
@@ -49,32 +72,97 @@ namespace WebApiTokenBasedAuthendication.Controllers
                 return Unauthorized();
             }
 
+            return Ok(CreateTokenResponse(user));
+        }
+
+        [HttpPost("refresh")]
+        public ActionResult<TokenResponse> Refresh(RefreshTokenRequestBody refreshTokenRequestBody)
+        {
+            if (string.IsNullOrWhiteSpace(refreshTokenRequestBody.RefreshToken))
+            {
+                return BadRequest("Refresh token is required.");
+            }
+
+            if (!RefreshTokens.TryRemove(refreshTokenRequestBody.RefreshToken, out var refreshTokenInfo))
+            {
+                return Unauthorized("Invalid refresh token.");
+            }
+
+            if (refreshTokenInfo.ExpiresAtUtc < DateTime.UtcNow)
+            {
+                return Unauthorized("Refresh token has expired.");
+            }
+
+            var user = GetUserById(refreshTokenInfo.UserId);
+            if (user is null)
+            {
+                return Unauthorized();
+            }
+
+            return Ok(CreateTokenResponse(user));
+        }
+
+        private TokenResponse CreateTokenResponse(RequestedUserinfo user)
+        {
             var securityKey = new SymmetricSecurityKey(Encoding.ASCII.GetBytes(_configuration["Authendication:SecretForKey"]));
             var signingCredentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
 
-            var claimsForToken = new List<Claim> ();
-            claimsForToken.Add(new Claim("sub",user.UserId.ToString()));
-            claimsForToken.Add(new Claim("given_name", user.FirstName));
-            claimsForToken.Add(new Claim("family_name", user.LastName));
-            claimsForToken.Add(new Claim("city",user.City));
-            
+            var accessTokenExpiryUtc = DateTime.UtcNow.AddMinutes(15);
+
+            var claimsForToken = new List<Claim>
+            {
+                new("sub", user.UserId.ToString()),
+                new("given_name", user.FirstName ?? string.Empty),
+                new("family_name", user.LastName ?? string.Empty),
+                new("city", user.City)
+            };
+
             var jwtSecurityToken = new JwtSecurityToken(
                 _configuration["Authendication:Issuer"],
                 _configuration["Authendication:Audience"],
                 claimsForToken,
                 DateTime.UtcNow,
-                DateTime.UtcNow.AddHours(1),
+                accessTokenExpiryUtc,
                 signingCredentials);
-           
+
             var tokenToReturn = new JwtSecurityTokenHandler().WriteToken(jwtSecurityToken);
+            var refreshToken = GenerateRefreshToken();
+            var refreshTokenExpiryUtc = DateTime.UtcNow.AddDays(7);
 
-            return Ok(tokenToReturn);
+            RefreshTokens[refreshToken] = new RefreshTokenInfo
+            {
+                UserId = user.UserId,
+                ExpiresAtUtc = refreshTokenExpiryUtc
+            };
 
+            return new TokenResponse
+            {
+                AccessToken = tokenToReturn,
+                RefreshToken = refreshToken,
+                AccessTokenExpiryUtc = accessTokenExpiryUtc,
+                RefreshTokenExpiryUtc = refreshTokenExpiryUtc
+            };
         }
 
-        private RequestedUserinfo ValidateUserCredentials(string? userName, string? password)
+        private static string GenerateRefreshToken()
         {
-            return new RequestedUserinfo(1,"Mr.X","FirestName","LastName","Acity");
+            var randomNumber = RandomNumberGenerator.GetBytes(64);
+            return Convert.ToBase64String(randomNumber);
+        }
+
+        private RequestedUserinfo? ValidateUserCredentials(string? userName, string? password)
+        {
+            return new RequestedUserinfo(1, userName ?? "Mr.X", "FirestName", "LastName", "Acity");
+        }
+
+        private RequestedUserinfo? GetUserById(int userId)
+        {
+            if (userId != 1)
+            {
+                return null;
+            }
+
+            return new RequestedUserinfo(1, "Mr.X", "FirestName", "LastName", "Acity");
         }
     }
 }
